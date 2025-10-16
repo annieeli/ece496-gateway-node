@@ -8,7 +8,7 @@ def parse_args():
     parser.add_argument(
         "-p",
         "--port",
-        default="/dev/ttyUSB0",
+        default="/dev/ttyUSB1",
         help="Provide serial port",
     )
     parser.add_argument(

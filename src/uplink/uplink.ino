@@ -1,36 +1,188 @@
-#define THRESHOLD 40   /* Greater the value, more the sensitivity */
-#include<atomic>
+#include <atomic>
+#include "driver/uart.h"
+#include "esp_sleep.h"
 
-const int LED_PIN = 2;
+#define THRESHOLD 40
+#define BUF_SIZE  4096
+#define DATA_SIZE 1024
+#define LED_PIN   2
+#define LIGHT_SLEEP_TIMEOUT (10000 * 1000ULL)
+
+enum Msg : uint8_t { 
+  MSG_BUFFER_FULL, 
+  MSG_END_DCP, 
+  MSG_LIGHT_SLEEP, 
+  MSG_DEEP_SLEEP 
+};
 
 TaskHandle_t main_task_handle = NULL;
 TaskHandle_t read_data_task_handle = NULL;
 TaskHandle_t upload_data_task_handle = NULL;
+TaskHandle_t power_manager_task_handle = NULL;
 
-std::atomic<bool> dataCollectionActive;
-unsigned long lightSleepStartTime = 0;
-const unsigned long lightSleepTimeout = 10000; 
+QueueHandle_t dcpQueue  = NULL;
+QueueHandle_t powerQueue = NULL;
 
-RTC_DATA_ATTR int bootCount = 0;
+std::atomic<bool> dataCollectionActive {false};
+std::atomic<bool> dataUploadingActive {false};
 
+uint8_t dataBufferA[BUF_SIZE];
+uint8_t dataBufferB[BUF_SIZE];
+uint8_t *activeBuffer = dataBufferA;
+uint8_t *uploadBuffer = NULL;
+static uint8_t data[DATA_SIZE];
+int offset = 0;
+String command;
+
+// for uart_read_bytes() to read data sent from downlink module
+void init_uart() {
+  const uart_config_t uart_config = {
+      .baud_rate = 9600,
+      .data_bits = UART_DATA_8_BITS,
+      .parity    = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+  };
+
+  uart_param_config(UART_NUM_1, &uart_config);
+  uart_set_pin(UART_NUM_1, 17, 16, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_driver_install(UART_NUM_1, BUF_SIZE * 2, 0, 0, NULL, 0);
+}
+
+static void enter_light_sleep_ms() {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  /* below comment only works after integrating w downlink - wake up should be controlled
+  by uart (ReqData/END_DCP) or timer (timeout) */
+  // esp_sleep_enable_uart_wakeup(UART_NUM_1); 
+  // esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_TIMEOUT);
+
+  /* currently wake up from a 2 second timer*/
+  esp_sleep_enable_timer_wakeup(2000 * 1000ULL);
+
+  Serial.println("DCP enters light sleep");
+  Serial.flush();
+  esp_light_sleep_start();
+
+  Serial.println("DCP wakes up from light sleep");
+
+  /* below comment only works after integrating w downlink - if wakes up cause of timer, 
+  wake up and go to deep sleep */
+  // esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  // if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+  //   Serial.println("Light sleep timeout reached.");
+  //   tear_down();
+  // } else {
+  //   Serial.println("DCP wakes up from light sleep");
+  // }
+}
+
+void tear_down() {
+  Serial.println("Going to sleep now");
+  // flush() blocks the program until Serial is done
+  // This prevents deep sleep from being interfered by Serial
+  Serial.flush();
+
+  digitalWrite(LED_PIN, LOW);
+  esp_deep_sleep_start();
+}
+
+// task to read data from uart
 void read_data_sub_task(void *pvParameters) {
-  for (;;) {
-    if (dataCollectionActive) {
+  while(true) {
+      dataCollectionActive = true;
       Serial.println("Task 1: Reading data from UART and storing in buffer...");
-      delay(700);
-    } else {
+      
+      // obtain data
+      //int len = uart_read_bytes(UART_NUM_1, data, DATA_SIZE, pdMS_TO_TICKS(500));
+      int len = 2048;
+      memset(data,1,len);
+     
+      // notify DTT if buffer is full
+      if (len > 0) {
+          if ((offset + len) >= BUF_SIZE) {
+              // amount that fits in current buffer
+              int bytesToFill = BUF_SIZE - offset;
+              memcpy(activeBuffer + offset, data, bytesToFill);
+              Serial.println("Buffer full, fill up rest of buffer");
+
+              // notify upload
+              Msg bufferFullMsg = MSG_BUFFER_FULL;
+              uploadBuffer = activeBuffer;
+              vTaskResume(upload_data_task_handle);
+              xQueueSend(dcpQueue, &bufferFullMsg, portMAX_DELAY);
+              Serial.println("Notify Upload Task");
+
+              // swap buffers
+              activeBuffer = (activeBuffer == dataBufferA) ? dataBufferB : dataBufferA;
+              offset = 0;
+              Serial.println("Buffer swapped");
+
+              // write remaining data to new buffer
+              int remaining = len - bytesToFill;
+              if (remaining > 0) {
+                  memcpy(activeBuffer + offset, data + bytesToFill, remaining);
+                  offset += remaining;
+              }
+              Serial.println("Fill up remaining of data to new buffer");
+          } else {
+              // fits fully
+              memcpy(activeBuffer + offset, data, len);
+              offset += len;
+              Serial.println("Fill up buffer");
+          }
+      }
+
+      // go to light sleep after finishing
+      dataCollectionActive = false;
+      Msg sleepMode = MSG_LIGHT_SLEEP;
+      vTaskResume(power_manager_task_handle);
+      xQueueSend(powerQueue, &sleepMode, portMAX_DELAY);
+      vTaskDelay(pdMS_TO_TICKS(10));
       vTaskSuspend(NULL);
+  }
+}
+
+// upload data to cloud
+void upload_data_sub_task(void *pvParameters) {
+  Msg data;
+  while(true) {
+    // receive data buffer to upload
+    if (xQueueReceive(dcpQueue, &data, portMAX_DELAY)){
+      dataUploadingActive = true;
+      Serial.println("Task 2: Uploading data to the cloud...");
+      //TODO: upload data to cloud
+      if(uploadBuffer != NULL){
+        Serial.println("Upload buffer if not null");
+        uploadBuffer = NULL;
+      }
+      dataUploadingActive = false;
+
+      // go to light/deep sleep
+      Msg sleepMode = (command == "END_DCP") ? MSG_DEEP_SLEEP : MSG_LIGHT_SLEEP;
+      vTaskResume(power_manager_task_handle);
+      xQueueSend(powerQueue, &sleepMode, portMAX_DELAY);
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
 }
 
-void upload_data_sub_task(void *pvParameters) {
-  for (;;) {
-    if (dataCollectionActive) {
-      Serial.println("Task 2: Uploading data to the cloud...");
-      delay(1000);
-    } else {
-      vTaskSuspend(NULL);
+void power_manager_task(void *pvParameters) {
+  Msg sleepMode;
+  while (true) {
+    if (xQueueReceive(powerQueue, &sleepMode, portMAX_DELAY)) {
+      if (sleepMode == MSG_LIGHT_SLEEP) {
+        if (!dataCollectionActive && !dataUploadingActive) {
+          Serial.println("Both idle, go to light sleep");
+          enter_light_sleep_ms();
+        }
+      }
+      else if (sleepMode == MSG_DEEP_SLEEP) {
+        if (!dataCollectionActive && !dataUploadingActive) {
+          Serial.println("DCP done, go to deep sleep");
+          tear_down();
+        }
+      }
     }
   }
 }
@@ -59,8 +211,10 @@ void config_task(void *pvParameters) {
   tear_down();
 }
 
-// TODO: This currently pretends to use light sleep but does not actually
 void dcp_manager_task(void *pvParameters) {
+  init_uart();
+  dcpQueue = xQueueCreate(8, sizeof(Msg));
+  powerQueue = xQueueCreate(8, sizeof(Msg));
   xTaskCreatePinnedToCore(
     read_data_sub_task,
     "read_data_sub_task",
@@ -69,6 +223,7 @@ void dcp_manager_task(void *pvParameters) {
     1,
     &read_data_task_handle,
     0);
+  vTaskSuspend(read_data_task_handle);
 
   xTaskCreatePinnedToCore(
     upload_data_sub_task,
@@ -79,34 +234,37 @@ void dcp_manager_task(void *pvParameters) {
     &upload_data_task_handle,
     1);
 
+  xTaskCreatePinnedToCore(
+    power_manager_task,
+    "power_manager_task",
+    10000,
+    NULL,
+    1,
+    &power_manager_task_handle,
+    1);
+
   Serial.println("\n--- Task: DCP Manager (Light Sleep Logic) ---");
   Serial.println("Waiting for 'ReqData' or 'END_DCP' command...");
-  unsigned long lightSleepStartTime = millis();
 
+  enter_light_sleep_ms();
+  
   while (true) {
-    String command = get_command();
+    command = get_command();
 
     if (command == "ReqData") {
       Serial.println("ReqData received. Starting data collection tasks.");
-      dataCollectionActive = true;
       vTaskResume(read_data_task_handle);
-      vTaskResume(upload_data_task_handle);
-
-      delay(5000);
-      dataCollectionActive = false;
-      Serial.println("Data collection period finished. Awaiting next command...");
-      lightSleepStartTime = millis(); 
-
-    } else if (command == "END_DCP") {
+    } 
+    
+    else if (command == "END_DCP") {
       Serial.println("END_DCP received.");
-      tear_down();
+      Msg endDcpMsg = MSG_END_DCP;
+      if (activeBuffer != NULL) {
+        uploadBuffer = activeBuffer;
+      }
+      vTaskResume(upload_data_task_handle);
+      xQueueSend(dcpQueue, &endDcpMsg, portMAX_DELAY);
     }
-
-    if (millis() - lightSleepStartTime > lightSleepTimeout) {
-      Serial.println("Light sleep timeout reached.");
-      tear_down();
-    }
-    delay(100); 
   }
 }
 
@@ -122,7 +280,7 @@ String get_command() {
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 
-  String command = Serial.readStringUntil('\n');
+  command = Serial.readStringUntil('\n');
   if (command == NULL) {
     command = "";
   }
@@ -200,16 +358,6 @@ void print_wakeup_reason() {
   }
 }
 
-void tear_down() {
-  Serial.println("Going to sleep now");
-  // flush() blocks the program until Serial is done
-  // This prevents deep sleep from being interfered by Serial
-  Serial.flush();
-
-  digitalWrite(LED_PIN, LOW);
-  esp_deep_sleep_start();
-}
-
 void create_tasks_from_command(String command) {
   if (command == "INIT") {
     xTaskCreate(get_intent_task, "GetIntentTask", 4096, NULL, 1, &main_task_handle);
@@ -229,17 +377,14 @@ void setup() {
   touchSleepWakeUpEnable(T3, THRESHOLD);
 
   Serial.begin(9600);
-  // Serial.setTimeout(1000 * 10);
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
   Serial.println();
-  // ++bootCount;
-  // Serial.println("Boot number: " + String(bootCount));
 
   Serial.println("\n--- Woke up from DEEP_SLEEP: Awaiting command (INIT, INTENT, DCP, CONFIG) ---");
-  String command = get_command();
+  command = get_command();
 
   Serial.println("Command received: " + command);
   print_wakeup_reason();

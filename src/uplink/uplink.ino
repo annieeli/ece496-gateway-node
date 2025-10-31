@@ -34,10 +34,9 @@ static uint8_t data[DATA_SIZE];
 int offset = 0;
 String command;
 
-// for uart_read_bytes() to read data sent from downlink module
 void init_uart() {
   const uart_config_t uart_config = {
-      .baud_rate = 9600,
+      .baud_rate = 115200,
       .data_bits = UART_DATA_8_BITS,
       .parity    = UART_PARITY_DISABLE,
       .stop_bits = UART_STOP_BITS_1,
@@ -90,56 +89,56 @@ void tear_down() {
 // task to read data from uart
 void read_data_sub_task(void *pvParameters) {
   while(true) {
-      dataCollectionActive = true;
-      Serial.println("Task 1: Reading data from UART and storing in buffer...");
-      
-      // obtain data
-      //int len = uart_read_bytes(UART_NUM_1, data, DATA_SIZE, pdMS_TO_TICKS(500));
-      int len = 2048;
-      memset(data,1,len);
-     
-      // notify DTT if buffer is full
-      if (len > 0) {
-          if ((offset + len) >= BUF_SIZE) {
-              // amount that fits in current buffer
-              int bytesToFill = BUF_SIZE - offset;
-              memcpy(activeBuffer + offset, data, bytesToFill);
-              Serial.println("Buffer full, fill up rest of buffer");
+    dataCollectionActive = true;
+    Serial.println("Task 1: Reading data from UART and storing in buffer...");
+    
+    // obtain data
+    // TODO: currently using 5sec timeout for ease of dev/debug with emulator
+    // TODO: potentially need to trim/sanitize data
+    int len = uart_read_bytes(UART_NUM_1, data, DATA_SIZE, pdMS_TO_TICKS(5000));
+    
+    // notify DTT if buffer is full
+    if (len > 0) {
+      if ((offset + len) >= BUF_SIZE) {
+        // amount that fits in current buffer
+        int bytesToFill = BUF_SIZE - offset;
+        memcpy(activeBuffer + offset, data, bytesToFill);
+        Serial.println("Buffer full, fill up rest of buffer");
 
-              // notify upload
-              Msg bufferFullMsg = MSG_BUFFER_FULL;
-              uploadBuffer = activeBuffer;
-              vTaskResume(upload_data_task_handle);
-              xQueueSend(dcpQueue, &bufferFullMsg, portMAX_DELAY);
-              Serial.println("Notify Upload Task");
+        // notify upload
+        Msg bufferFullMsg = MSG_BUFFER_FULL;
+        uploadBuffer = activeBuffer;
+        vTaskResume(upload_data_task_handle);
+        xQueueSend(dcpQueue, &bufferFullMsg, portMAX_DELAY);
+        Serial.println("Notify Upload Task");
 
-              // swap buffers
-              activeBuffer = (activeBuffer == dataBufferA) ? dataBufferB : dataBufferA;
-              offset = 0;
-              Serial.println("Buffer swapped");
+        // swap buffers
+        activeBuffer = (activeBuffer == dataBufferA) ? dataBufferB : dataBufferA;
+        offset = 0;
+        Serial.println("Buffer swapped");
 
-              // write remaining data to new buffer
-              int remaining = len - bytesToFill;
-              if (remaining > 0) {
-                  memcpy(activeBuffer + offset, data + bytesToFill, remaining);
-                  offset += remaining;
-              }
-              Serial.println("Fill up remaining of data to new buffer");
-          } else {
-              // fits fully
-              memcpy(activeBuffer + offset, data, len);
-              offset += len;
-              Serial.println("Fill up buffer");
-          }
+        // write remaining data to new buffer
+        int remaining = len - bytesToFill;
+        if (remaining > 0) {
+          memcpy(activeBuffer + offset, data + bytesToFill, remaining);
+          offset += remaining;
+        }
+        Serial.println("Fill up remaining of data to new buffer");
+      } else {
+        // fits fully
+        memcpy(activeBuffer + offset, data, len);
+        offset += len;
+        Serial.println("Fill up buffer");
       }
+    }
 
-      // go to light sleep after finishing
-      dataCollectionActive = false;
-      Msg sleepMode = MSG_LIGHT_SLEEP;
-      vTaskResume(power_manager_task_handle);
-      xQueueSend(powerQueue, &sleepMode, portMAX_DELAY);
-      vTaskDelay(pdMS_TO_TICKS(10));
-      vTaskSuspend(NULL);
+    // go to light sleep after finishing
+    dataCollectionActive = false;
+    Msg sleepMode = MSG_LIGHT_SLEEP;
+    vTaskResume(power_manager_task_handle);
+    xQueueSend(powerQueue, &sleepMode, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskSuspend(NULL);
   }
 }
 
@@ -151,7 +150,10 @@ void upload_data_sub_task(void *pvParameters) {
     if (xQueueReceive(dcpQueue, &data, portMAX_DELAY)){
       dataUploadingActive = true;
       Serial.println("Task 2: Uploading data to the cloud...");
-      //TODO: upload data to cloud
+      // TODO: upload data to cloud
+
+      // debug print buffer data
+      Serial.printf("Buffer: %s\n", (char*)uploadBuffer);
       if(uploadBuffer != NULL){
         Serial.println("Upload buffer if not null");
         uploadBuffer = NULL;
@@ -199,6 +201,10 @@ void get_intent_task(void *pvParameters) {
 void send_intent_task(void *pvParameters) {
   Serial.println("\n--- Task: SEND_INTENT ---");
   Serial.println("Sending intent data to other MCU via UART.");
+
+  // TODO: replace dummy buffer with intent once implemented
+  uint8_t dummy_buffer[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  uart_write_bytes(UART_NUM_1, (const char*)dummy_buffer, sizeof(dummy_buffer));
   delay(1000);
   tear_down();
 }
@@ -212,7 +218,6 @@ void config_task(void *pvParameters) {
 }
 
 void dcp_manager_task(void *pvParameters) {
-  init_uart();
   dcpQueue = xQueueCreate(8, sizeof(Msg));
   powerQueue = xQueueCreate(8, sizeof(Msg));
   xTaskCreatePinnedToCore(
@@ -380,6 +385,8 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
+
+  init_uart();
 
   Serial.println();
 

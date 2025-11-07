@@ -4,8 +4,10 @@
 
 #define THRESHOLD 40
 #define BUF_SIZE  4096
-#define DATA_SIZE 1024
+#define DATA_SIZE 1
 #define LED_PIN   2
+#define RDY_PIN   26
+#define WAKE_PIN  27
 #define LIGHT_SLEEP_TIMEOUT (10000 * 1000ULL)
 
 enum Msg : uint8_t { 
@@ -32,11 +34,18 @@ uint8_t *activeBuffer = dataBufferA;
 uint8_t *uploadBuffer = NULL;
 static uint8_t data[DATA_SIZE];
 int offset = 0;
-String command;
+uint8_t command;
+
+enum DOWNLINK_MESSAGES {
+  INIT = 1,
+  INTENT,
+  DCP,
+  END_DCP
+};
 
 void init_uart() {
   const uart_config_t uart_config = {
-      .baud_rate = 115200,
+      .baud_rate = 9600,
       .data_bits = UART_DATA_8_BITS,
       .parity    = UART_PARITY_DISABLE,
       .stop_bits = UART_STOP_BITS_1,
@@ -48,42 +57,43 @@ void init_uart() {
   uart_driver_install(UART_NUM_1, BUF_SIZE * 2, 0, 0, NULL, 0);
 }
 
-static void enter_light_sleep_ms() {
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-
-  /* below comment only works after integrating w downlink - wake up should be controlled
-  by uart (ReqData/END_DCP) or timer (timeout) */
-  // esp_sleep_enable_uart_wakeup(UART_NUM_1); 
-  // esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_TIMEOUT);
-
-  /* currently wake up from a 2 second timer*/
-  esp_sleep_enable_timer_wakeup(2000 * 1000ULL);
-
-  Serial.println("DCP enters light sleep");
-  Serial.flush();
-  esp_light_sleep_start();
-
-  Serial.println("DCP wakes up from light sleep");
-
-  /* below comment only works after integrating w downlink - if wakes up cause of timer, 
-  wake up and go to deep sleep */
-  // esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  // if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-  //   Serial.println("Light sleep timeout reached.");
-  //   tear_down();
-  // } else {
-  //   Serial.println("DCP wakes up from light sleep");
-  // }
-}
-
 void tear_down() {
-  Serial.println("Going to sleep now");
+  Serial.println("Entering deep sleep");
   // flush() blocks the program until Serial is done
   // This prevents deep sleep from being interfered by Serial
   Serial.flush();
 
   digitalWrite(LED_PIN, LOW);
   esp_deep_sleep_start();
+}
+
+static void enter_light_sleep_ms() {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  // Want to differentiate between waking for different pin type,
+  esp_sleep_enable_ext0_wakeup((gpio_num_t) WAKE_PIN, 1);
+  uint64_t wake_pin_mask = (1ULL << RDY_PIN);
+  esp_sleep_enable_ext1_wakeup(wake_pin_mask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  Serial.println("Entering light sleep");
+  Serial.flush();
+  esp_light_sleep_start();
+
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  switch (cause)
+  {
+  case 2:
+    Serial.printf("Woke up due to WAKE_PIN\n");
+    break;
+
+  case 3:
+    Serial.printf("Woke up due to RDY_PIN\n");
+    break;
+  
+  default:
+    Serial.printf("Unknown wakeup reason\n");
+    break;
+  }
 }
 
 // task to read data from uart
@@ -95,7 +105,7 @@ void read_data_sub_task(void *pvParameters) {
     // obtain data
     // TODO: currently using 5sec timeout for ease of dev/debug with emulator
     // TODO: potentially need to trim/sanitize data
-    int len = uart_read_bytes(UART_NUM_1, data, DATA_SIZE, pdMS_TO_TICKS(5000));
+    int len = uart_read_bytes(UART_NUM_1, &data, DATA_SIZE, pdMS_TO_TICKS(5000));
     
     // notify DTT if buffer is full
     if (len > 0) {
@@ -153,7 +163,12 @@ void upload_data_sub_task(void *pvParameters) {
       // TODO: upload data to cloud
 
       // debug print buffer data
-      Serial.printf("Buffer: %s\n", (char*)uploadBuffer);
+      Serial.printf("Buffer: ");
+      for (size_t i = 0; i < offset; i++) {
+        Serial.printf("%02X ", uploadBuffer[i]);
+      }
+      Serial.println();
+
       if(uploadBuffer != NULL){
         Serial.println("Upload buffer if not null");
         uploadBuffer = NULL;
@@ -161,7 +176,7 @@ void upload_data_sub_task(void *pvParameters) {
       dataUploadingActive = false;
 
       // go to light/deep sleep
-      Msg sleepMode = (command == "END_DCP") ? MSG_DEEP_SLEEP : MSG_LIGHT_SLEEP;
+      Msg sleepMode = (command == END_DCP) ? MSG_DEEP_SLEEP : MSG_LIGHT_SLEEP;
       vTaskResume(power_manager_task_handle);
       xQueueSend(powerQueue, &sleepMode, portMAX_DELAY);
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -187,34 +202,6 @@ void power_manager_task(void *pvParameters) {
       }
     }
   }
-}
-
-void get_intent_task(void *pvParameters) {
-  Serial.println("\n--- Task: GET_INTENT ---");
-  Serial.println("Connecting to cloud...");
-  delay(1000);
-  Serial.println("Getting intent data and storing it.");
-  delay(1000);
-  tear_down();
-}
-
-void send_intent_task(void *pvParameters) {
-  Serial.println("\n--- Task: SEND_INTENT ---");
-  Serial.println("Sending intent data to other MCU via UART.");
-
-  // TODO: replace dummy buffer with intent once implemented
-  uint8_t dummy_buffer[] = {0xDE, 0xAD, 0xBE, 0xEF};
-  uart_write_bytes(UART_NUM_1, (const char*)dummy_buffer, sizeof(dummy_buffer));
-  delay(1000);
-  tear_down();
-}
-
-void config_task(void *pvParameters) {
-  Serial.println("\n--- Task: CONFIG ---");
-  Serial.println("Device being configured...");
-  delay(2000);
-  Serial.println("Configuration finished.");
-  tear_down();
 }
 
 void dcp_manager_task(void *pvParameters) {
@@ -248,20 +235,21 @@ void dcp_manager_task(void *pvParameters) {
     &power_manager_task_handle,
     1);
 
-  Serial.println("\n--- Task: DCP Manager (Light Sleep Logic) ---");
-  Serial.println("Waiting for 'ReqData' or 'END_DCP' command...");
+  Serial.println("\n--- Task: DCP Manager ---");
 
   enter_light_sleep_ms();
-  
-  while (true) {
-    command = get_command();
 
-    if (command == "ReqData") {
+  while (true) {
+    // TODO MAX 180 seconds
+    get_command();
+
+    // TODO: interrupt?
+    if (digitalRead(RDY_PIN) == HIGH) {
       Serial.println("ReqData received. Starting data collection tasks.");
       vTaskResume(read_data_task_handle);
     } 
     
-    else if (command == "END_DCP") {
+    else if (command == END_DCP) {
       Serial.println("END_DCP received.");
       Msg endDcpMsg = MSG_END_DCP;
       if (activeBuffer != NULL) {
@@ -273,6 +261,34 @@ void dcp_manager_task(void *pvParameters) {
   }
 }
 
+void get_intent_task(void *pvParameters) {
+  Serial.println("\n--- Task: GET_INTENT ---");
+  Serial.println("Connecting to cloud...");
+  delay(1000);
+  Serial.println("Getting intent data and storing it.");
+  delay(1000);
+  tear_down();
+}
+
+void send_intent_task(void *pvParameters) {
+  Serial.println("\n--- Task: SEND_INTENT ---");
+  Serial.println("Sending intent data to downlink via UART.");
+
+  // TODO: replace dummy buffer with intent once implemented
+  // uint8_t dummy_buffer[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  // uart_write_bytes(UART_NUM_1, (const char*)dummy_buffer, sizeof(dummy_buffer));
+  delay(1000);
+  tear_down();
+}
+
+void config_task(void *pvParameters) {
+  Serial.println("\n--- Task: CONFIG ---");
+  Serial.println("Device being configured...");
+  delay(2000);
+  Serial.println("Configuration finished.");
+  tear_down();
+}
+
 void default_task(void *pvParameters) {
   Serial.println("default_task");
   delay(1000);
@@ -280,98 +296,20 @@ void default_task(void *pvParameters) {
 }
 
 // TODO: This is basically blocking, which is not great, there should be some timeout
-String get_command() {
-  while (Serial.available() == 0) {
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-
-  command = Serial.readStringUntil('\n');
-  if (command == NULL) {
-    command = "";
-  }
-  command.trim();
-  return command;
-}
-
-void print_wakeup_touchpad() {
-  switch (esp_sleep_get_touchpad_wakeup_status()) {
-    case 0:  Serial.println("Touch detected on GPIO 4"); break;
-    case 1:  Serial.println("Touch detected on GPIO 0"); break;
-    case 2:  Serial.println("Touch detected on GPIO 2"); break;
-    case 3:  Serial.println("Touch detected on GPIO 15"); break;
-    case 4:  Serial.println("Touch detected on GPIO 13"); break;
-    case 5:  Serial.println("Touch detected on GPIO 12"); break;
-    case 6:  Serial.println("Touch detected on GPIO 14"); break;
-    case 7:  Serial.println("Touch detected on GPIO 27"); break;
-    case 8:  Serial.println("Touch detected on GPIO 33"); break;
-    case 9:  Serial.println("Touch detected on GPIO 32"); break;
-    default: Serial.println("Wakeup not by touchpad"); break;
+void get_command() {
+  int message_len = 0;
+  while (message_len == 0) {
+    message_len = uart_read_bytes(UART_NUM_1, &command, DATA_SIZE, pdMS_TO_TICKS(5000));
   }
 }
 
-void print_wakeup_reason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
-
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_UNDEFINED: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_UNDEFINED");
-      break;
-    case ESP_SLEEP_WAKEUP_ALL: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_ALL");
-      break;
-    case ESP_SLEEP_WAKEUP_EXT0: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_EXT0");
-      break;
-    case ESP_SLEEP_WAKEUP_EXT1: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_EXT1");
-      break;
-    case ESP_SLEEP_WAKEUP_TIMER: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_TIMER");
-      break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_TOUCHPAD");
-      break;
-    case ESP_SLEEP_WAKEUP_ULP: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_ULP");
-      break;
-    case ESP_SLEEP_WAKEUP_GPIO: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_GPIO");
-      break;
-    case ESP_SLEEP_WAKEUP_UART: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_UART");
-      break;
-    case ESP_SLEEP_WAKEUP_WIFI: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_WIFI");
-      break;
-    case ESP_SLEEP_WAKEUP_COCPU: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_COCPU");
-      break;
-    case ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG");
-      break;
-    case ESP_SLEEP_WAKEUP_BT: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_BT");
-      break;
-    case ESP_SLEEP_WAKEUP_VAD: 
-      Serial.println("reason: ESP_SLEEP_WAKEUP_VAD");
-      break;
-    default: 
-      Serial.println("reason: default");
-      break;
-  }
-}
-
-void create_tasks_from_command(String command) {
-  if (command == "INIT") {
+void create_tasks_from_command(uint8_t command) {
+  if (command == INIT) {
     xTaskCreate(get_intent_task, "GetIntentTask", 4096, NULL, 1, &main_task_handle);
-  } else if (command == "INTENT") {
+  } else if (command == INTENT) {
     xTaskCreate(send_intent_task, "SendIntentTask", 4096, NULL, 1, &main_task_handle);
-  } else if (command == "DCP") {
+  } else if (command == DCP) {
     xTaskCreate(dcp_manager_task, "DCPManagerTask", 4096, NULL, 1, &main_task_handle);
-  } else if (command == "CONFIG") {
-    xTaskCreate(config_task, "ConfigTask", 4096, NULL, 1, &main_task_handle);
   } else {
     Serial.println("Unknown command. Going back to sleep.");
     tear_down();
@@ -379,22 +317,22 @@ void create_tasks_from_command(String command) {
 }
 
 void setup() {
-  touchSleepWakeUpEnable(T3, THRESHOLD);
-
-  Serial.begin(9600);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t) WAKE_PIN, 1);
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
+  pinMode(RDY_PIN, INPUT);
+  pinMode(WAKE_PIN, INPUT);
 
+  Serial.begin(9600);
   init_uart();
 
-  Serial.println();
+  Serial.printf("\n\n--- Woke up from DEEP_SLEEP: Awaiting command (INIT - 0x1, INTENT - 0x2, DCP - 0x3) ---\n");
+  get_command();
+  Serial.printf("Command received: %d\n", command);
 
-  Serial.println("\n--- Woke up from DEEP_SLEEP: Awaiting command (INIT, INTENT, DCP, CONFIG) ---");
-  command = get_command();
+  // TODO: Config tasks calling
 
-  Serial.println("Command received: " + command);
-  print_wakeup_reason();
   create_tasks_from_command(command);
 }
 

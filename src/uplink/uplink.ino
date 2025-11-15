@@ -275,9 +275,16 @@ void send_intent_task(void *pvParameters) {
   Serial.println("Sending intent data to downlink via UART.");
 
   // TODO: replace dummy buffer with intent once implemented
-  // uint8_t dummy_buffer[] = {0xDE, 0xAD, 0xBE, 0xEF};
-  // uart_write_bytes(UART_NUM_1, (const char*)dummy_buffer, sizeof(dummy_buffer));
-  delay(1000);
+  uint8_t dummy_buffer[7];
+  dummy_buffer[0] = 0xA5;
+  dummy_buffer[1] = 0x5A;
+  dummy_buffer[2] = 0x99;
+  dummy_buffer[3] = (300 >> 24) & 0xFF;
+  dummy_buffer[4] = (300 >> 16) & 0xFF;
+  dummy_buffer[5] = (300 >> 8) & 0xFF;
+  dummy_buffer[6] = 300 & 0xFF;
+
+  uart_write_bytes(UART_NUM_1, (const char*)dummy_buffer, sizeof(dummy_buffer));
   tear_down();
 }
 
